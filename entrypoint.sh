@@ -1,0 +1,259 @@
+#!/bin/bash
+# aicodebox-base entrypoint — agent-agnostic.
+#
+# Responsibilities:
+#  1. UID/GID rematch against the mounted workspace
+#  2. Docker socket GID fix
+#  3. Once per container, run the child image's /aicodebox-init.d/*.sh, then
+#     the user's $HOME/.aicodebox/init.d/*.sh (marker in the container
+#     filesystem at /var/lib/aicodebox/init-done)
+#  4. Load persisted auth env vars
+#  5. Dispatch to a mode (api/telegram/cron) or fall through to the agent's
+#     interactive/passthrough CLI via the configured adapter
+#
+# Child images may set:
+#   AICODEBOX_ADAPTER=pkg.module:Class   # required for modes
+#   AICODEBOX_AGENT_BINARY=pi            # the bin name for passthrough invocation
+set -euo pipefail
+
+log() {
+    local level="$1" message="$2"
+    jq -cn \
+        --arg time "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        --arg level "$level" \
+        --arg file "${BASH_SOURCE[1]##*/}" \
+        --argjson line "${BASH_LINENO[0]}" \
+        --arg func "${FUNCNAME[1]:-main}" \
+        --arg msg "$message" \
+        '{time:$time,level:$level,file:$file,line:$line,func:$func,msg:$msg}' >&2
+}
+trap 'log ERROR "container entrypoint failed"' ERR
+
+for identity_var in AICODEBOX_GIT_NAME AICODEBOX_GIT_EMAIL; do
+    case "${!identity_var:-}" in
+        *$'\n'* | *$'\r'*)
+            log ERROR "$identity_var must be a single line"
+            exit 1
+            ;;
+    esac
+done
+
+dbg() {
+    if [ "${DEBUG:-}" = "true" ]; then
+        echo "[entrypoint $(date +%H:%M:%S.%3N)] $*" >&2
+    fi
+}
+
+usage() {
+    cat <<EOF >&2
+usage: <container> [args passed to the agent CLI]
+
+env (mode flags — pick a foreground mode + optional MCP):
+  AICODEBOX_API_MODE=1            run the FastAPI server (programmatic API)
+  AICODEBOX_TELEGRAM_MODE=1       run the telegram bot
+  AICODEBOX_CRON_MODE=1           run the cron scheduler
+  AICODEBOX_MCP_MODE=1            expose the MCP server (coexists w/ any mode)
+
+env (mode config):
+  AICODEBOX_API_MODE_PORT=8080    port for API mode
+  AICODEBOX_API_MODE_TOKEN=...    bearer token for API mode (empty = no auth)
+  AICODEBOX_TELEGRAM_MODE_TOKEN   bot token from @BotFather
+  AICODEBOX_TELEGRAM_MODE_CONFIG  path to telegram yaml
+  AICODEBOX_CRON_MODE_FILE=path   yaml file for cron mode
+  AICODEBOX_MCP_MODE_PORT=8081    port for standalone MCP server
+  AICODEBOX_MCP_MODE_TOKEN=...    bearer token for MCP (no fallback)
+  AICODEBOX_MCP_MODE_ALLOWED_HOSTS=...    comma-separated MCP Host allowlist
+  AICODEBOX_MCP_MODE_ALLOWED_ORIGINS=...  comma-separated MCP Origin allowlist
+
+env (adapter):
+  AICODEBOX_ADAPTER               pkg.module:Class for the active agent
+  AICODEBOX_AGENT_BINARY          fallback binary for passthrough (default: pi)
+
+env (container):
+  AICODEBOX_WORKSPACE             host workspace path (mounted at same path)
+  AICODEBOX_CONTAINER_NAME        used for container-scoped state files
+EOF
+}
+
+# ── 1. UID/GID match to workspace owner ───────────────────────────────────────
+AICODE_WORKSPACE="${AICODEBOX_WORKSPACE:-${AICODE_WORKSPACE:-/workspace}}"
+AICODE_CONTAINER_NAME="${AICODEBOX_CONTAINER_NAME:-${AICODE_CONTAINER_NAME:-aicodebox}}"
+
+if [ -d "$AICODE_WORKSPACE" ]; then
+    HOST_UID=$(stat -c '%u' "$AICODE_WORKSPACE")
+    HOST_GID=$(stat -c '%g' "$AICODE_WORKSPACE")
+    CURRENT_UID=$(id -u aicode)
+    CURRENT_GID=$(id -g aicode)
+    if [ "$HOST_UID" != "0" ] && [ "$HOST_GID" != "0" ]; then
+        if [ "$HOST_GID" != "$CURRENT_GID" ]; then
+            # -o (non-unique): the workspace's owning GID may already belong
+            # to an unrelated pre-existing group (e.g. Ubuntu's stock "users"
+            # at GID 100, a common collision with NFS/NAS exports that use
+            # that same convention) — without it groupmod refuses outright.
+            groupmod -o -g "$HOST_GID" aicode
+        fi
+        if [ "$HOST_UID" != "$CURRENT_UID" ]; then
+            # Same reasoning as groupmod -o above, for the UID side.
+            usermod -o -u "$HOST_UID" aicode
+        fi
+        find /home/aicode \( ! -user "$HOST_UID" -o ! -group "$HOST_GID" \) -print0 |
+            xargs -0 -r -P "$(($(nproc) / 2 + 1))" chown aicode:aicode 2>/dev/null || true
+    fi
+fi
+
+# ── 2. docker socket GID ──────────────────────────────────────────────────────
+if [ -S /var/run/docker.sock ]; then
+    SOCKET_GID=$(stat -c '%g' /var/run/docker.sock)
+    CURRENT_DOCKER_GID=$(getent group docker | cut -d: -f3 || echo "")
+    if [ -n "$SOCKET_GID" ] && [ -n "$CURRENT_DOCKER_GID" ] &&
+        [ "$SOCKET_GID" != "$CURRENT_DOCKER_GID" ]; then
+        groupmod -o -g "$SOCKET_GID" docker
+    fi
+fi
+
+for identity_field in name email; do
+    case "$identity_field" in
+        name) identity_value="${AICODEBOX_GIT_NAME:-}" ;;
+        email) identity_value="${AICODEBOX_GIT_EMAIL:-}" ;;
+    esac
+    [ -n "$identity_value" ] || continue
+    if ! sudo -u aicode -H git config --global --replace-all -- "user.$identity_field" "$identity_value"; then
+        log ERROR "cannot configure runtime Git $identity_field"
+        exit 1
+    fi
+done
+unset identity_var identity_field identity_value
+
+# ── 3. first-run init.d ───────────────────────────────────────────────────────
+# The child image's scripts run first, then the user's from the state dir.
+# The marker lives in the container filesystem rather than under
+# $HOME/.aicodebox: child images bind-mount that directory from the host, and
+# a marker on the mount made every container after the first skip init.
+readonly AICODE_STATE_DIR="/home/aicode/.aicodebox"
+readonly IMAGE_INIT_DIR="/aicodebox-init.d"
+readonly USER_INIT_DIR="${AICODE_STATE_DIR}/init.d"
+readonly USER_BIN_DIR="${AICODE_STATE_DIR}/bin"
+readonly INIT_MARKER="/var/lib/aicodebox/init-done"
+readonly AICODE_PATH="${USER_BIN_DIR}:/home/aicode/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+# sudo resets PATH to secure_path, so pass the runtime PATH explicitly.
+run_init_scripts() {
+    local dir="$1"
+    local script
+    [ -d "$dir" ] || return 0
+    for script in "$dir"/*.sh; do
+        [ -f "$script" ] || continue
+        dbg "running init script: $script"
+        if ! sudo -E -u aicode -H env "PATH=$AICODE_PATH" bash "$script"; then
+            echo "[entrypoint] init script $script failed" >&2
+        fi
+    done
+}
+
+if [ ! -f "$INIT_MARKER" ]; then
+    mkdir -p "$AICODE_STATE_DIR" "$(dirname "$INIT_MARKER")"
+    chown aicode:aicode "$AICODE_STATE_DIR"
+    run_init_scripts "$IMAGE_INIT_DIR"
+    run_init_scripts "$USER_INIT_DIR"
+    touch "$INIT_MARKER"
+fi
+
+# ── 4. load persisted auth env ────────────────────────────────────────────────
+AUTH_FILE="/home/aicode/.aicodebox/.${AICODE_CONTAINER_NAME}-auth"
+if [ -f "$AUTH_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$AUTH_FILE"
+    set +a
+fi
+
+# ── 5. decide what to run ─────────────────────────────────────────────────────
+#
+# Foreground modes (mutually exclusive, priority order): API > Telegram > Cron.
+# Telegram + Cron is the one allowed pair — cron runs in-thread inside telegram.
+# MCP mode is independent — it can coexist with any foreground mode, served on
+# its own port. In API mode the MCP surface is mounted at /mcp on the API port
+# (no extra process). In other modes (telegram/cron/passthrough), MCP runs as
+# a background uvicorn process spawned before the foreground exec.
+_mode_module=""
+if [ "${AICODEBOX_API_MODE:-}" = "1" ]; then
+    _mode_module="aicodebox.modes.api"
+elif [ "${AICODEBOX_TELEGRAM_MODE:-}" = "1" ] && [ "${AICODEBOX_CRON_MODE:-}" = "1" ]; then
+    _mode_module="aicodebox.modes.telegram"
+elif [ "${AICODEBOX_TELEGRAM_MODE:-}" = "1" ]; then
+    _mode_module="aicodebox.modes.telegram"
+elif [ "${AICODEBOX_CRON_MODE:-}" = "1" ]; then
+    _mode_module="aicodebox.modes.cron"
+fi
+
+# MCP standalone runs as a sidecar process unless the foreground IS the API
+# (then /mcp is mounted in-process).
+_spawn_mcp_sidecar=0
+if [ "${AICODEBOX_MCP_MODE:-}" = "1" ] && [ "$_mode_module" != "aicodebox.modes.api" ]; then
+    _spawn_mcp_sidecar=1
+fi
+
+# ── 6. build env exports & dispatch ───────────────────────────────────────────
+AICODE_UID=$(id -u aicode)
+AICODE_GID=$(id -g aicode)
+
+ENV_EXPORTS="export HOME=/home/aicode"
+ENV_EXPORTS="$ENV_EXPORTS; export PATH=$AICODE_PATH"
+
+# Forward auth-relevant env vars verbatim (the adapter decides which it needs).
+for var in ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_OAUTH_TOKEN \
+    ANTHROPIC_BASE_URL ANTHROPIC_MODEL CLAUDE_CODE_OAUTH_TOKEN \
+    OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ORG_ID \
+    GEMINI_API_KEY OPENROUTER_API_KEY ZAI_API_KEY \
+    GROQ_API_KEY DEEPSEEK_API_KEY XAI_API_KEY MISTRAL_API_KEY; do
+    val="$(printenv "$var" 2>/dev/null || true)"
+    if [ -n "$val" ]; then
+        ENV_EXPORTS="$ENV_EXPORTS; export $var=$(printf '%q' "$val")"
+    fi
+done
+
+# aicodebox-specific env (modes + adapter selection).
+for var in AICODEBOX_ADAPTER AICODEBOX_AGENT_BINARY AICODEBOX_WORKSPACE \
+    AICODEBOX_CONTAINER_NAME \
+    AICODEBOX_AVAILABLE_MODELS AICODEBOX_AVAILABLE_EFFORTS \
+    AICODEBOX_API_MODE AICODEBOX_API_MODE_PORT AICODEBOX_API_MODE_TOKEN \
+    AICODEBOX_TELEGRAM_MODE AICODEBOX_TELEGRAM_MODE_TOKEN \
+    AICODEBOX_TELEGRAM_MODE_CONFIG AICODEBOX_TELEGRAM_MODE_OVERRIDES \
+    AICODEBOX_CRON_MODE AICODEBOX_CRON_MODE_FILE AICODEBOX_CRON_MODE_HISTORY_DIR \
+    AICODEBOX_MCP_MODE AICODEBOX_MCP_MODE_PORT AICODEBOX_MCP_MODE_TOKEN \
+    AICODEBOX_MCP_MODE_ALLOWED_HOSTS \
+    AICODEBOX_MCP_MODE_ALLOWED_ORIGINS \
+    TELEGRAM_CHAT_ID DEBUG; do
+    val="$(printenv "$var" 2>/dev/null || true)"
+    if [ -n "$val" ]; then
+        ENV_EXPORTS="$ENV_EXPORTS; export $var=$(printf '%q' "$val")"
+    fi
+done
+
+if [ -n "$_mode_module" ]; then
+    _FG_INVOKE="exec python3 -m $_mode_module"
+else
+    # Fall through to the agent's own CLI for interactive / passthrough use.
+    AGENT_BIN="${AICODEBOX_AGENT_BINARY:-pi}"
+    ESCAPED="$(printf '%q' "$AGENT_BIN")"
+    for a in "$@"; do
+        ESCAPED="$ESCAPED $(printf '%q' "$a")"
+    done
+    _FG_INVOKE="exec $ESCAPED"
+fi
+
+# MCP sidecar: spawn as a background subshell that traps its parent's exit so
+# the python uvicorn dies with the container. The foreground exec then takes
+# over PID 1 and dictates container lifetime.
+if [ "$_spawn_mcp_sidecar" = "1" ]; then
+    _MCP_INVOKE="python3 -m aicodebox.modes.mcp &"
+    PY_INVOKE="$_MCP_INVOKE $_FG_INVOKE"
+else
+    PY_INVOKE="$_FG_INVOKE"
+fi
+
+cd "$AICODE_WORKSPACE" 2>/dev/null || cd /workspace
+
+dbg "$PY_INVOKE"
+exec setpriv --reuid="$AICODE_UID" --regid="$AICODE_GID" --init-groups \
+    bash -c "$ENV_EXPORTS && cd $(printf '%q' "$AICODE_WORKSPACE") && $PY_INVOKE"
