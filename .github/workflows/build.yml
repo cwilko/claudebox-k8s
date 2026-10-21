@@ -31,4 +31,4 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           no-cache: true
-          tags: cwilko/claudebox-k8s:latest
+          tags: wilkobets/claudebox-k8s:latest
